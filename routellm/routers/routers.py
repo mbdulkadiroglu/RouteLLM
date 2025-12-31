@@ -118,9 +118,13 @@ class BERTRouter(Router):
         inputs = self.tokenizer(
             prompt, return_tensors="pt", padding=True, truncation=True
         )
+        # Move inputs to the same device as the model
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
         with torch.no_grad():
             outputs = self.model(**inputs)
-            logits = outputs.logits.numpy()[0]
+            logits = outputs.logits.cpu().numpy()[0]  # Move back to CPU for numpy
 
         exp_scores = np.exp(logits - np.max(logits))
         softmax_scores = exp_scores / np.sum(exp_scores)
@@ -252,6 +256,55 @@ class RandomRouter(Router):
         del prompt
         return random.uniform(0, 1)
 
+# --- PASTE THIS BEFORE THE 'ROUTER_CLS' DICTIONARY ---
+import requests
+
+class OllamaRouter(Router):
+    def __init__(self, model="llama3.3:70b", host="http://localhost:11434"):
+        self.model = model
+        self.host = host
+        self.api_url = f"{host}/api/generate"
+
+    def calculate_strong_win_rate(self, prompt):
+        # New Prompt: Ask for a granularity of 1-10
+        routing_prompt = (
+            f"Analyze the difficulty of the following query.\n"
+            f"Rate it on a scale of 1 to 10.\n"
+            f"1 = Very Easy (Chat, simple questions).\n"
+            f"10 = Very Hard (Complex math, coding, reasoning).\n"
+            f"Reply with ONLY the number.\n\n"
+            f"Query: {prompt}\n\n"
+            f"Answer:"
+        )
+
+        payload = {
+            "model": self.model,
+            "prompt": routing_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.0,
+                "num_predict": 5  # Keep it short
+            }
+        }
+
+        try:
+            response = requests.post(self.api_url, json=payload)
+            response.raise_for_status()
+            text = response.json().get("response", "").strip()
+            
+            # Extract number and normalize to 0.0 - 1.0
+            import re
+            match = re.search(r"\d+", text)
+            if match:
+                score = int(match.group())
+                # Clamp between 1 and 10
+                score = max(1, min(10, score))
+                return score / 10.0  # Returns 0.1, 0.2, ... 1.0
+            
+            return 0.5 # Default if parsing fails
+        except Exception as e:
+            print(f"Error: {e}")
+            return 0.5
 
 ROUTER_CLS = {
     "random": RandomRouter,
@@ -259,5 +312,6 @@ ROUTER_CLS = {
     "causal_llm": CausalLLMRouter,
     "bert": BERTRouter,
     "sw_ranking": SWRankingRouter,
+    "ollama": OllamaRouter,
 }
 NAME_TO_CLS = {v: k for k, v in ROUTER_CLS.items()}
